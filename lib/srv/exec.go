@@ -132,7 +132,7 @@ func (e *localExec) Start(channel ssh.Channel) (*ExecResult, error) {
 	var err error
 
 	// parse the command to see if the user is trying to run scp
-	err = e.parseSecureCopy()
+	err = e.transformSecureCopy()
 	if err != nil {
 		return nil, trace.Wrap(err)
 	}
@@ -227,7 +227,7 @@ func prepareInteractiveCommand(ctx *ServerContext) (*exec.Cmd, error) {
 	return c, nil
 }
 
-func (e *localExec) parseSecureCopy() error {
+func (e *localExec) transformSecureCopy() error {
 	// split up command by space to grab the first word. if we don't have anything
 	// it's an interactive shell the user requested and not scp, return
 	args := strings.Split(e.GetCommand(), " ")
@@ -481,19 +481,22 @@ func (r *remoteExec) collectRemoteStatus(err error) (*ExecResult, error) {
 }
 
 func emitExecAuditEvent(ctx *ServerContext, cmd string, status *ExecResult, err error) {
-	// report the result of this exec event to the audit logger
+	// Report the result of this exec event to the audit logger.
 	auditLog := ctx.srv.GetAuditLog()
 	if auditLog == nil {
 		log.Warnf("No audit log")
 		return
 	}
+
+	var eventType string
+
+	// Create common fields for event.
 	fields := events.EventFields{
-		events.ExecEventCommand: cmd,
-		events.EventUser:        ctx.Identity.TeleportUser,
-		events.EventLogin:       ctx.Identity.Login,
-		events.LocalAddr:        ctx.Conn.LocalAddr().String(),
-		events.RemoteAddr:       ctx.Conn.RemoteAddr().String(),
-		events.EventNamespace:   ctx.srv.GetNamespace(),
+		events.EventUser:      ctx.Identity.TeleportUser,
+		events.EventLogin:     ctx.Identity.Login,
+		events.LocalAddr:      ctx.Conn.LocalAddr().String(),
+		events.RemoteAddr:     ctx.Conn.RemoteAddr().String(),
+		events.EventNamespace: ctx.srv.GetNamespace(),
 	}
 	if err != nil {
 		fields[events.ExecEventError] = err.Error()
@@ -501,7 +504,26 @@ func emitExecAuditEvent(ctx *ServerContext, cmd string, status *ExecResult, err 
 			fields[events.ExecEventCode] = strconv.Itoa(status.Code)
 		}
 	}
-	auditLog.EmitAuditEvent(events.ExecEvent, fields)
+
+	// Parse the exec command to find out if it was SCP or not.
+	path, flag, isSCP, er := parseSecureCopy(cmd)
+	if err != nil {
+		log.Warnf("Unable to emit audit event: %v.", er)
+		return
+	}
+
+	// Update appropriate fields based off if the request was SCP or not.
+	if isSCP {
+		eventType = events.SCPEvent
+		fields[events.SCPPath] = path
+		fields[events.SCPAction] = actionFromFlag(flag)
+	} else {
+		eventType = events.ExecEvent
+		fields[events.ExecEventCommand] = cmd
+	}
+
+	// Emit the event.
+	auditLog.EmitAuditEvent(eventType, fields)
 }
 
 // getDefaultEnvPath returns the default value of PATH environment variable for
@@ -557,4 +579,36 @@ func getDefaultEnvPath(uid string, loginDefsPath string) string {
 		return envSuPath
 	}
 	return envPath
+}
+
+// parseSecureCopy will parse a command and return if it's secure copy or not.
+// This function is able to detect both "teleport scp" and "scp" from OpenSSH.
+func parseSecureCopy(path string) (string, string, bool, error) {
+	parts := strings.Fields(path)
+
+	// Get the full path of this (Teleport) binary.
+	teleportPath, err := osext.Executable()
+	if err != nil {
+		return "", "", false, trace.Wrap(err)
+	}
+
+	switch {
+	// OpenSSH SCP.
+	case len(parts) == 3 && parts[0] == teleport.SCP:
+		return parts[2], parts[1], true, nil
+	// Teleport SCP.
+	case len(parts) == 8 && parts[2] == teleportPath:
+		return parts[7], parts[6], true, nil
+	// Unknown format.
+	default:
+		return "", "", false, nil
+	}
+}
+
+// actionFromFlag converts SCP flags into a human readable action.
+func actionFromFlag(flag string) string {
+	if flag == "-t" {
+		return events.SCPUpload
+	}
+	return events.SCPDownload
 }
